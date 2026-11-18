@@ -551,11 +551,15 @@ describe.skipIf(!process.env.DATABASE_URL)("BackgroundTaskManager - Persistent J
     expect(job2Middle.status).toBe("pending"); // Not popped yet!
     expect(executedOrder).toEqual(["bp-1"]);
 
-    // Wait for Job 1 to finish and Job 2 to execute (150ms + 100ms extra)
-    await new Promise((r) => setTimeout(r, 220));
-
+    // Wait for Job 1 to finish and Job 2 to execute. Poll with a deadline instead of a fixed
+    // sleep: on a slow CI runner the second claim + completion can take longer than 220ms.
+    const deadline = Date.now() + 3_000;
+    let job2Final = await getJobByIdQuery(jobId2);
+    while (job2Final.status !== "completed" && Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, 25));
+      job2Final = await getJobByIdQuery(jobId2);
+    }
     const job1Final = await getJobByIdQuery(jobId1);
-    const job2Final = await getJobByIdQuery(jobId2);
 
     expect(job1Final.status).toBe("completed");
     expect(job2Final.status).toBe("completed");
