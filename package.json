@@ -1,0 +1,23 @@
+{
+  "name": "onsight-jobs",
+  "version": "1.0.0",
+  "description": "Persistent background job queue shared by onsight-backend and onsight-async (public.background_jobs).",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts",
+    "./queries": "./src/queries.ts"
+  },
+  "files": [
+    "src"
+  ],
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test:unit": "bun --no-env-file test test/background-task.test.ts",
+    "test:sql": "bun test --parallel=1 test/background-task-persistent.test.ts"
+  },
+  "devDependencies": {
+    "bun-types": "1.4.0",
+    "typescript": "5.9.3"
+  }
+}
