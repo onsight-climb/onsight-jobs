@@ -14,7 +14,8 @@ Il repository è privato. I consumer lo dichiarano come dipendenza git fissata a
 
 ```typescript
 import { BackgroundTaskManager } from "onsight-jobs";
-// Query di basso livello (test, strumenti): import { popNextBackgroundJobQuery } from "onsight-jobs/queries";
+// Query di basso livello: import { popNextBackgroundJobQuery } from "onsight-jobs/queries";
+// Helper solo per i test (DELETE per pattern): import { cleanBackgroundJobsTableQuery } from "onsight-jobs/testing";
 ```
 
 Il pacchetto esporta sorgenti TypeScript (Bun li esegue direttamente) e usa la connessione `sql` di default di Bun (`DATABASE_URL`).
@@ -224,7 +225,7 @@ Un job persistente interrotto allo step 4 **non fallisce**: il wrapper chiama `r
 
 I runner devono quindi rispettare `signal` e restare idempotenti: un job interrotto viene rieseguito dall'inizio.
 
-Limite noto: i task già estratti dal DB ma ancora nella coda in memoria (oltre `maxConcurrency`) non sono eseguiti né requeue-ati dal wrapper; restano `running` e vengono recuperati dal `resetStuckRunningJobsQuery` al riavvio dopo `timeout_ms + 10s`.
+Job acquisiti ma non ancora conclusi allo spegnimento (runner che ignora `signal`, o job ancora nella coda in memoria oltre `maxConcurrency`) non restano `running`: `shutdown()` attende al massimo `shutdownHardTimeoutMs` (default 5000 ms, `configure()`) e poi li restituisce alla coda con lo stesso `requeueInterruptedJobQuery`. Anche un tick di polling in volo viene atteso, così un job appena acquisito viene restituito prima dell'uscita. Solo un `SIGKILL` (o un crash) lascia righe `running`: le recupera `resetStuckRunningJobsQuery` al successivo `startWorker()`, dopo `timeout_ms` + 10 s.
 
 Su Railway imposta il *draining time* del deployment ad almeno `SHUTDOWN_GRACE_MS` + 5 secondi, altrimenti il `SIGKILL` arriva prima dell'abort e del requeue.
 

@@ -7,6 +7,8 @@ const {
   cleanBackgroundJobsTableQuery,
   getJobByIdQuery: findJobByIdQuery,
   getCompletedJobsCountQuery,
+} = await import("../src/testing.js");
+const {
   popNextBackgroundJobQuery,
   enqueueJobQuery,
   requeueInterruptedJobQuery,
@@ -705,5 +707,60 @@ describe.skipIf(!process.env.DATABASE_URL)("BackgroundTaskManager - Persistent J
     expect(job.status).toBe("pending");
     expect(job.attempts).toBe(0);
     expect(job.error_message).toBe("Interrupted by shutdown");
+  });
+  it("should requeue a claimed job whose runner ignores the abort, after the hard timeout", async () => {
+    // Arrange: a runner that never looks at its signal and never finishes on its own.
+    BackgroundTaskManager.configure({ silent: true, shutdownHardTimeoutMs: 100 });
+    let release: () => void = () => {};
+    BackgroundTaskManager.registerRunner("test-persistent-deaf-runner", async () => {
+      await new Promise<void>((resolve) => {
+        release = resolve;
+      });
+    });
+    const jobId = await BackgroundTaskManager.enqueue("test-persistent-deaf-runner", {});
+    expect(await (BackgroundTaskManager as any).pollAndExecute()).toBe(true);
+
+    // Act: the drain must still terminate (bounded by grace + hard timeout).
+    const started = performance.now();
+    const { timedOut } = await BackgroundTaskManager.startDrain(50).done;
+
+    // Assert: handed back with the attempt refunded instead of being left 'running'.
+    expect(timedOut).toBe(true);
+    expect(performance.now() - started).toBeLessThan(2_000);
+    const job = await getJobByIdQuery(jobId);
+    expect(job.status).toBe("pending");
+    expect(job.attempts).toBe(0);
+    expect(job.error_message).toBe("Interrupted by shutdown");
+    release();
+  });
+
+  it("should requeue a claimed job still queued in memory when shutdown rejects the queue", async () => {
+    // Arrange: two slots; one is busy before the claim, the other fills while the claim awaits
+    // the DB, so the claimed job lands in the in-memory queue instead of starting.
+    BackgroundTaskManager.configure({ silent: true, maxConcurrency: 2 });
+    const blocker = (signal: AbortSignal) =>
+      new Promise<void>((_resolve, reject) => {
+        signal.addEventListener("abort", () => reject(new DOMException("aborted", "AbortError")));
+      });
+    let runnerStarted = false;
+    BackgroundTaskManager.registerRunner("test-persistent-queued-claim", async () => {
+      runnerStarted = true;
+    });
+    const jobId = await BackgroundTaskManager.enqueue("test-persistent-queued-claim", {});
+    BackgroundTaskManager.run(blocker, "test-blocker-1");
+    const claim = (BackgroundTaskManager as any).pollAndExecute() as Promise<boolean>;
+    BackgroundTaskManager.run(blocker, "test-blocker-2");
+    expect(await claim).toBe(true);
+    expect(BackgroundTaskManager.getQueueCount()).toBe(1);
+    expect((await getJobByIdQuery(jobId)).status).toBe("running");
+
+    // Act
+    await BackgroundTaskManager.shutdown();
+
+    // Assert: never executed, back in the queue, attempt refunded.
+    expect(runnerStarted).toBe(false);
+    const job = await getJobByIdQuery(jobId);
+    expect(job.status).toBe("pending");
+    expect(job.attempts).toBe(0);
   });
 });

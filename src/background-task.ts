@@ -96,6 +96,16 @@ export class BackgroundTaskManager {
   private static isWorkerRunning = false;
   private static workerPollIntervalMs = 5000;
   private static workerStarted = false; // Tracks if startWorker was explicitly called
+  /** The poll tick currently awaiting the DB, if any: shutdown waits for it (bounded). */
+  private static currentTick: Promise<void> | null = null;
+  /**
+   * Persistent jobs this process claimed ('running' in the DB) whose wrapper has not settled.
+   * A job stays here if its runner ignores the abort, or if it was still queued in memory when
+   * shutdown rejected the queue: shutdown requeues whatever is left so no row stays 'running'.
+   */
+  private static claimedJobIds = new Set<string>();
+  /** Upper bound on how long shutdown() waits for aborted tasks before requeueing leftovers. */
+  private static shutdownHardTimeoutMs = 5000;
 
   static getIsWorkerRunning(): boolean {
     return this.isWorkerRunning;
@@ -142,10 +152,15 @@ export class BackgroundTaskManager {
   static configure(options: {
     maxConcurrency?: number;
     silent?: boolean;
+    /** Max wait (ms) in shutdown() for aborted tasks before requeueing leftovers. Default: 5000 */
+    shutdownHardTimeoutMs?: number;
   }): void {
     if (options.maxConcurrency !== undefined) {
       this.maxConcurrency = options.maxConcurrency;
       this.processQueue();
+    }
+    if (options.shutdownHardTimeoutMs !== undefined) {
+      this.shutdownHardTimeoutMs = options.shutdownHardTimeoutMs;
     }
     if (options.silent !== undefined) {
       this.silent = options.silent;
@@ -631,7 +646,7 @@ export class BackgroundTaskManager {
       },
     );
 
-    const runTick = async () => {
+    const tick = async (): Promise<void> => {
       if (!this.isWorkerRunning || this.isShuttingDown) return;
       this.workerTimer = null;
       try {
@@ -655,6 +670,16 @@ export class BackgroundTaskManager {
       if (this.isWorkerRunning && !this.isShuttingDown) {
         this.workerTimer = setTimeout(runTick, pollIntervalMs);
       }
+    };
+
+    // Track the in-flight tick so shutdown can wait for it: a tick that already claimed a job
+    // must get to hand it back before the process exits.
+    const runTick = (): void => {
+      const current = tick();
+      this.currentTick = current;
+      void current.finally(() => {
+        if (this.currentTick === current) this.currentTick = null;
+      });
     };
 
     this.workerTimer = setTimeout(runTick, pollIntervalMs);
@@ -741,6 +766,9 @@ export class BackgroundTaskManager {
       return false;
     }
 
+    // Tracked until the wrapper below settles; see claimedJobIds.
+    this.claimedJobIds.add(id);
+
     // Run the task using BackgroundTaskManager.run() to inherit all execution logic (concurrency, logging, timeouts)
     BackgroundTaskManager.run(
       async (signal) => {
@@ -820,6 +848,8 @@ export class BackgroundTaskManager {
             }
           }
           throw err;
+        } finally {
+          this.claimedJobIds.delete(id);
         }
       },
       {
@@ -844,17 +874,23 @@ export class BackgroundTaskManager {
    * Callers that own other pollers (e.g. a cron scheduler) must stop those first.
    */
   static startDrain(graceMs: number): DrainHandle {
+    // Goes through the public API (not the private fields) so consumers can stub each step.
     this.stopWorker();
-    this.isShuttingDown = true;
+    this.setShuttingDown(true);
 
-    const activeCount = this.activeTasks.size;
+    const activeCount = this.getActiveCount();
 
     const done = (async (): Promise<DrainResult> => {
       let graceTimer: ReturnType<typeof setTimeout> | undefined;
       const timeout = new Promise<"timeout">((resolve) => {
         graceTimer = setTimeout(() => resolve("timeout"), graceMs);
       });
-      const drained = this.waitForAll().then(() => "drained" as const);
+      const drained = (async () => {
+        // A tick mid-claim hands its job back once it sees the flag; wait for it as well.
+        if (this.currentTick) await this.currentTick;
+        await this.waitForAll();
+        return "drained" as const;
+      })();
       const outcome = await Promise.race([drained, timeout]);
       clearTimeout(graceTimer);
 
@@ -915,7 +951,44 @@ export class BackgroundTaskManager {
       }
     }
 
-    await this.waitForAll();
+    // Bounded wait: a runner that ignores its AbortSignal (or a tick stuck on the DB) must not
+    // keep the process alive until the platform SIGKILLs it, which would skip the requeue below.
+    let hardTimer: ReturnType<typeof setTimeout> | undefined;
+    const hardTimeout = new Promise<"timeout">((resolve) => {
+      hardTimer = setTimeout(() => resolve("timeout"), this.shutdownHardTimeoutMs);
+    });
+    const settled = (async () => {
+      if (this.currentTick) await this.currentTick;
+      await this.waitForAll();
+      return "settled" as const;
+    })();
+    const outcome = await Promise.race([settled, hardTimeout]);
+    clearTimeout(hardTimer);
+
+    // Claimed jobs whose wrapper never settled: still running past the hard timeout, or
+    // rejected while queued in memory. Hand them back (the status = 'running' guard keeps a
+    // job that settled meanwhile untouched).
+    const leftovers = Array.from(this.claimedJobIds);
+    this.claimedJobIds.clear();
+    if (leftovers.length > 0) {
+      this.log(
+        "warn",
+        `\x1b[33m[BACKGROUND TASK SHUTDOWN]\x1b[0m Requeueing ${leftovers.length} claimed job(s) that did not settle${outcome === "timeout" ? ` within ${this.shutdownHardTimeoutMs}ms` : ""}.`,
+      );
+      const results = await Promise.allSettled(
+        leftovers.map((jobId) => requeueInterruptedJobQuery(jobId)),
+      );
+      results.forEach((result, index) => {
+        if (result.status === "rejected") {
+          this.log(
+            "error",
+            `Failed to requeue job ${leftovers[index]} at shutdown:`,
+            result.reason,
+          );
+        }
+      });
+    }
+
     this.log(
       "log",
       `\x1b[32m[BACKGROUND TASK SHUTDOWN]\x1b[0m Graceful shutdown complete.`,
@@ -946,5 +1019,8 @@ export class BackgroundTaskManager {
     this.activeTasks.clear();
 
     this.pendingPromises.clear();
+    this.claimedJobIds.clear();
+    this.currentTick = null;
+    this.shutdownHardTimeoutMs = 5000;
   }
 }

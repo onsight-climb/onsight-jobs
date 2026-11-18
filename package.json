@@ -1,12 +1,13 @@
 {
   "name": "onsight-jobs",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Persistent background job queue shared by onsight-backend and onsight-async (public.background_jobs).",
   "private": true,
   "type": "module",
   "exports": {
     ".": "./src/index.ts",
-    "./queries": "./src/queries.ts"
+    "./queries": "./src/queries.ts",
+    "./testing": "./src/testing.ts"
   },
   "files": [
     "src"
