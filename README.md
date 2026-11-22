@@ -4,11 +4,11 @@ Pacchetto condiviso da `onsight-backend` e `onsight-async`: **unica sorgente** d
 
 ## Installazione
 
-Il repository è privato. I consumer lo dichiarano come dipendenza git fissata a un tag:
+Il repository è pubblico: non serve nessun token. I consumer lo dichiarano come dipendenza git fissata a un tag:
 
 ```json
 "dependencies": {
-  "onsight-jobs": "git+https://github.com/onsight-climb/onsight-jobs.git#v1.0.0"
+  "onsight-jobs": "git+https://github.com/onsight-climb/onsight-jobs.git#v1.0.1"
 }
 ```
 
