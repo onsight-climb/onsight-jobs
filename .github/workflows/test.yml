@@ -1,9 +1,8 @@
 name: Tests
 
+# Started by hand only (Actions tab, Run workflow), for example before a release.
 on:
-  push:
-    branches: [main]
-  pull_request:
+  workflow_dispatch:
 
 permissions:
   contents: read
